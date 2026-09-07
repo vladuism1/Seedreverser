@@ -13,7 +13,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.LongStream;
 
@@ -41,6 +40,27 @@ public class StructureSeedSolver {
     // LCG constants (java.util.Random) — kept for the slime chunk formula
     private static final long MASK = (1L << 48) - 1;
 
+    // Cooperative cancellation — checked in the hot loops
+    private static volatile boolean cancelled = false;
+
+    public static void cancel() {
+        cancelled = true;
+    }
+
+    /**
+     * Solver threads: 2 fewer than cores (leave the game headroom),
+     * daemon (so quitting MC doesn't hang), low priority (game stays responsive).
+     */
+    private static ExecutorService newSolverExecutor() {
+        int threads = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
+        return Executors.newFixedThreadPool(threads, r -> {
+            Thread t = new Thread(r, "SeedReverser-Worker");
+            t.setDaemon(true);
+            t.setPriority(Thread.MIN_PRIORITY + 1);
+            return t;
+        });
+    }
+
     /**
      * Phase 1 — find 48-bit structure seeds from captured structure data.
      *
@@ -51,6 +71,7 @@ public class StructureSeedSolver {
         List<Long> results = new ArrayList<>();
         if (captures.isEmpty()) return results;
 
+        cancelled = false;
         System.out.println("[SeedReverser] Lifting with " + captures.size() + " structure(s)...");
 
         // ------------------------------------------------------------------
@@ -60,6 +81,10 @@ public class StructureSeedSolver {
         List<Long> survivingLowerBits = new ArrayList<>();
 
         for (long lowerBits = 0; lowerBits < (1L << 19); lowerBits++) {
+            if (cancelled) {
+                System.out.println("[SeedReverser] Cancelled during Phase A");
+                return results;
+            }
             ChunkRand rand = new ChunkRand();
             boolean matches = true;
 
@@ -88,16 +113,15 @@ public class StructureSeedSolver {
         // (adapted from SeedcrackerX TimeMachine.pokeLifting, MIT)
         // ------------------------------------------------------------------
         Set<Long> structureSeeds = ConcurrentHashMap.newKeySet();
-        AtomicInteger done = new AtomicInteger();
 
-        int threads = Math.max(1, Runtime.getRuntime().availableProcessors());
-        ExecutorService executor = Executors.newFixedThreadPool(threads);
+        ExecutorService executor = newSolverExecutor();
 
         // Split surviving lower values across threads
         List<List<Long>> partitions = new ArrayList<>();
-        for (int i = 0; i < threads; i++) partitions.add(new ArrayList<>());
+        int workerCount = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
+        for (int i = 0; i < workerCount; i++) partitions.add(new ArrayList<>());
         for (int i = 0; i < survivingLowerBits.size(); i++) {
-            partitions.get(i % threads).add(survivingLowerBits.get(i));
+            partitions.get(i % workerCount).add(survivingLowerBits.get(i));
         }
 
         for (List<Long> partition : partitions) {
@@ -106,6 +130,11 @@ public class StructureSeedSolver {
                 ChunkRand rand = new ChunkRand();
                 for (long lowerBits : partition) {
                     for (long upperBits = 0; upperBits < (1L << 29); upperBits++) {
+                        // Check cancel flag every ~1M iterations (cheap volatile read)
+                        if ((upperBits & 0xFFFFF) == 0 && cancelled) {
+                            return;
+                        }
+
                         long structureSeed = (upperBits << 19) | lowerBits;
 
                         boolean matches = true;
@@ -119,15 +148,23 @@ public class StructureSeedSolver {
                         if (matches) structureSeeds.add(structureSeed);
                     }
                 }
-                done.incrementAndGet();
             });
         }
 
         executor.shutdown();
         try {
-            executor.awaitTermination(6, TimeUnit.HOURS);
+            if (!executor.awaitTermination(15, TimeUnit.MINUTES)) {
+                executor.shutdownNow();
+            }
         } catch (InterruptedException e) {
+            executor.shutdownNow();
             Thread.currentThread().interrupt();
+        }
+
+        if (cancelled) {
+            System.out.println("[SeedReverser] Solver cancelled — returning partial results");
+            results.addAll(structureSeeds);
+            return results;
         }
 
         results.addAll(structureSeeds.stream().sorted().collect(Collectors.toList()));
@@ -140,11 +177,11 @@ public class StructureSeedSolver {
     // -----------------------------------------------------------------------
 
     public static List<Long> liftTo64Bit(long structureSeed, List<net.minecraft.world.level.ChunkPos> slimeChunks) {
-        int numCores = Math.max(1, Runtime.getRuntime().availableProcessors());
-        ExecutorService executor = Executors.newFixedThreadPool(numCores);
+        ExecutorService executor = newSolverExecutor();
         ConcurrentHashMap<Long, Boolean> results = new ConcurrentHashMap<>();
 
         final long TOTAL_UPPER = 1L << 16;
+        int numCores = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
         final long CHUNK_SIZE = Math.max(1, TOTAL_UPPER / numCores);
 
         for (int thread = 0; thread < numCores; thread++) {
@@ -172,7 +209,7 @@ public class StructureSeedSolver {
 
         executor.shutdown();
         try {
-            executor.awaitTermination(1, TimeUnit.HOURS);
+            executor.awaitTermination(10, TimeUnit.MINUTES);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }

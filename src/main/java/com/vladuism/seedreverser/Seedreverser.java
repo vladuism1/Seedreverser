@@ -177,42 +177,62 @@ public class Seedreverser implements ModInitializer {
                             send(src, "Solving with " + capturedStructures.size() + " structure(s) ("
                                     + String.format("%.1f", bits) + " bits)...");
 
+                            if (bits < 34) {
+                                send(src, "WARNING: with fewer than ~4 structures (34+ bits) Phase 1 can take HOURS.");
+                                send(src, "Capture more structures for speed. /seedreverser cancel stops the solver.");
+                            }
+
+                            // All messages from the solver thread must hop onto the
+                            // server thread — touching chat/server state off-thread is unsafe.
+                            var server = src.getServer();
+
                             new Thread(() -> {
                                 try {
                                     List<RegionStructure.Data<?>> captureList = new ArrayList<>(capturedStructures);
                                     List<Long> structureSeeds = StructureSeedSolver.findStructureSeeds(captureList);
 
                                     if (structureSeeds.isEmpty()) {
-                                        send(src, "No structure seeds found. Capture more structures in different regions.");
+                                        server.execute(() -> send(src,
+                                                "No structure seeds found. Capture more structures in different regions."));
                                         return;
                                     }
 
                                     List<ChunkPos> slimeList = new ArrayList<>(capturedSlimes);
 
                                     if (slimeList.isEmpty()) {
-                                        send(src, "Found " + structureSeeds.size() + " structure seed candidate(s):");
-                                        for (long s : structureSeeds) {
-                                            send(src, "  Structure seed: " + s);
-                                        }
-                                        send(src, "Find underground slimes (y<40) to narrow to the exact world seed!");
+                                        List<Long> finalSeeds = structureSeeds;
+                                        server.execute(() -> {
+                                            send(src, "Found " + finalSeeds.size() + " structure seed candidate(s):");
+                                            for (long s : finalSeeds) {
+                                                send(src, "  Structure seed: " + s);
+                                            }
+                                            send(src, "Find underground slimes (y<40) to narrow to the exact world seed!");
+                                        });
                                     } else {
                                         int found = 0;
                                         for (long structSeed : structureSeeds) {
                                             List<Long> worldSeeds = StructureSeedSolver.liftTo64Bit(structSeed, slimeList);
                                             for (long worldSeed : worldSeeds) {
-                                                send(src, ">>> WORLD SEED: " + worldSeed + " <<<");
+                                                server.execute(() -> send(src, ">>> WORLD SEED: " + worldSeed + " <<<"));
                                                 found++;
                                             }
                                         }
                                         if (found == 0) {
-                                            send(src, "No 64-bit seed matched. Capture more slime chunks.");
+                                            server.execute(() -> send(src, "No 64-bit seed matched. Capture more slime chunks."));
                                         }
                                     }
                                 } catch (Exception e) {
-                                    send(src, "Solver error: " + e.getMessage());
+                                    server.execute(() -> send(src, "Solver error: " + e.getMessage()));
                                 }
                             }, "SeedReverser-Solver").start();
 
+                            return 1;
+                        }))
+
+                .then(Commands.literal("cancel")
+                        .executes(ctx -> {
+                            StructureSeedSolver.cancel();
+                            send(ctx.getSource(), "Cancellation requested — solver will stop within a few seconds.");
                             return 1;
                         }))
 
