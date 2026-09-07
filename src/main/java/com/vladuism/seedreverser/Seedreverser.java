@@ -122,28 +122,23 @@ public class Seedreverser implements ModInitializer {
     }
 
     @SuppressWarnings("unchecked")
-    private static RegionStructure.Data<?> identifyStructure(ServerLevel world, StructureStart start, ChunkPos cPos) {
+    private static RegionStructure.Data<?> identifyStructure(ServerLevel world, StructureStart start, ChunkPos origin) {
         try {
-            List<Holder.Reference<net.minecraft.world.level.levelgen.structure.Structure>> elements =
-                    world.registryAccess().lookup(Registries.STRUCTURE)
-                            .stream()
-                            .flatMap(r -> r.listElements())
-                            .toList();
+            // O(1) reverse lookup (Registry.getResourceKey) instead of iterating
+            // the whole structure registry on every chunk load
+            net.minecraft.core.Registry<net.minecraft.world.level.levelgen.structure.Structure> registry =
+                    world.registryAccess().lookup(Registries.STRUCTURE).orElse(null);
+            if (registry == null) return null;
 
-            for (Holder.Reference<net.minecraft.world.level.levelgen.structure.Structure> ref : elements) {
-                if (ref.value() != start.getStructure()) continue;
+            ResourceKey<net.minecraft.world.level.levelgen.structure.Structure> key =
+                    registry.getResourceKey(start.getStructure()).orElse(null);
+            if (key == null) return null;
 
-                ResourceKey<net.minecraft.world.level.levelgen.structure.Structure> key =
-                        ref.unwrapKey().orElse(null);
-                if (key == null) continue;
+            OldStructure<?> structure = mapToMcFeatureStructure(key.identifier().toString());
+            if (structure == null) return null;
 
-                String id = key.identifier().toString();
-                OldStructure<?> structure = mapToMcFeatureStructure(id);
-                if (structure == null) continue;
-
-                // RegionStructure.at(chunkX, chunkZ) computes region coords + offsets
-                return (RegionStructure.Data<?>) structure.at(cPos.x(), cPos.z());
-            }
+            // RegionStructure.at(chunkX, chunkZ) computes region coords + offsets
+            return (RegionStructure.Data<?>) structure.at(origin.x(), origin.z());
         } catch (Exception ignored) {
         }
         return null;
