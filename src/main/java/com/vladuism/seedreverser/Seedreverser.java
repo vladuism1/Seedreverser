@@ -6,9 +6,15 @@ import com.seedfinding.mcfeature.Feature;
 import com.seedfinding.mcfeature.structure.DesertPyramid;
 import com.seedfinding.mcfeature.structure.Igloo;
 import com.seedfinding.mcfeature.structure.JunglePyramid;
+import com.seedfinding.mcfeature.structure.OceanRuin;
 import com.seedfinding.mcfeature.structure.OldStructure;
 import com.seedfinding.mcfeature.structure.RegionStructure;
+import com.seedfinding.mcfeature.structure.UniformStructure;
+import com.seedfinding.mcfeature.structure.RuinedPortal;
+import com.seedfinding.mcfeature.structure.Shipwreck;
 import com.seedfinding.mcfeature.structure.SwampHut;
+import com.seedfinding.mcfeature.structure.Village;
+import com.seedfinding.mccore.state.Dimension;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerChunkEvents;
@@ -45,6 +51,9 @@ public class Seedreverser implements ModInitializer {
     private static final JunglePyramid JUNGLE_PYRAMID = new JunglePyramid(SF_VERSION);
     private static final SwampHut SWAMP_HUT = new SwampHut(SF_VERSION);
     private static final Igloo IGLOO = new Igloo(SF_VERSION);
+    private static final OceanRuin OCEAN_RUIN = new OceanRuin(SF_VERSION);
+    private static final Shipwreck SHIPWRECK = new Shipwreck(SF_VERSION);
+    private static final Village VILLAGE = new Village(SF_VERSION);
 
     // Concurrent sets: mutated on the server thread, read on solver threads
     private static final Set<RegionStructure.Data<?>> capturedStructures = ConcurrentHashMap.newKeySet();
@@ -78,7 +87,10 @@ public class Seedreverser implements ModInitializer {
                 // wrong chunk would compute wrong region/offset data.
                 ChunkPos origin = start.getChunkPos();
 
-                RegionStructure.Data<?> data = identifyStructure(world, start, origin);
+                UniformStructure<?> structure = identifyStructure(world, start);
+                if (structure == null) continue;
+
+                RegionStructure.Data<?> data = structure.at(origin.x(), origin.z());
                 if (data == null) continue;
 
                 String dedupeKey = data.feature.getName() + ":" + origin.x() + ":" + origin.z();
@@ -123,8 +135,13 @@ public class Seedreverser implements ModInitializer {
         );
     }
 
-    @SuppressWarnings("unchecked")
-    private static RegionStructure.Data<?> identifyStructure(ServerLevel world, StructureStart start, ChunkPos origin) {
+    /**
+     * Returns the Seedfinding UniformStructure for a Minecraft structure start,
+     * or null if the structure isn't one we support.
+     * All supported structures are UniformStructure subclasses — safe for
+     * both Phase A (mod-4 filter) and Phase B (testStart verification).
+     */
+    private static UniformStructure<?> identifyStructure(ServerLevel world, StructureStart start) {
         try {
             // O(1) reverse lookup (Registry.getResourceKey) instead of iterating
             // the whole structure registry on every chunk load
@@ -136,21 +153,36 @@ public class Seedreverser implements ModInitializer {
                     registry.getResourceKey(start.getStructure()).orElse(null);
             if (key == null) return null;
 
-            OldStructure<?> structure = mapToMcFeatureStructure(key.identifier().toString());
-            if (structure == null) return null;
-
-            // RegionStructure.at(chunkX, chunkZ) computes region coords + offsets
-            return (RegionStructure.Data<?>) structure.at(origin.x(), origin.z());
+            return mapToMcFeatureStructure(key.identifier().toString(), world);
         } catch (Exception ignored) {
         }
         return null;
     }
 
-    private static OldStructure<?> mapToMcFeatureStructure(String structureId) {
+    private static UniformStructure<?> mapToMcFeatureStructure(String structureId, ServerLevel world) {
+        // UniformStructure tiers — all safe for Phase A (mod-4 filter) + Phase B (testStart)
         if (structureId.contains("desert_pyramid")) return DESERT_PYRAMID;
         if (structureId.contains("jungle_pyramid")) return JUNGLE_PYRAMID;
         if (structureId.contains("swamp_hut")) return SWAMP_HUT;
         if (structureId.contains("igloo")) return IGLOO;
+
+        // Ocean structures (UniformStructure — safe for Phase A + Phase B)
+        if (structureId.contains("ocean_ruin")) return OCEAN_RUIN;
+
+        // Shipwreck — overworld ocean/surface only (not nether/end)
+        if (structureId.contains("shipwreck")) return SHIPWRECK;
+
+        // Ruined portal — dimension-specific configs.
+        // Convert Minecraft's ResourceKey<Level> dimension to Seedfinding's Dimension enum.
+        if (structureId.contains("ruined_portal")) {
+            Dimension sfDim = Dimension.fromString(world.dimension().identifier().toString());
+            if (sfDim == null) sfDim = Dimension.OVERWORLD; // fallback
+            return new RuinedPortal(sfDim, SF_VERSION);
+        }
+
+        // Village (extends OldStructure → UniformStructure)
+        if (structureId.contains("village")) return VILLAGE;
+
         return null;
     }
 
