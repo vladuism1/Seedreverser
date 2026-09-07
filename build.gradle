@@ -1,74 +1,101 @@
+// noinspection GroovyAssignabilityCheck
 plugins {
-	id 'net.fabricmc.fabric-loom' version "${loom_version}"
-	id 'maven-publish'
+    id 'net.fabricmc.fabric-loom' version "${loom_version}"
+    id 'maven-publish'
+}
+
+version = project.version
+group = project.group
+
+base {
+    archivesName = "seedreverser"
 }
 
 repositories {
-	maven { url = "https://maven.fabricmc.net/" }
-	mavenCentral()
+    mavenCentral()
+
+    exclusiveContent {
+        forRepository {
+            repositories.maven {
+                url = uri("https://maven.latticg.com/")
+            }
+        }
+        filter {
+            includeModule("com.seedfinding", "latticg")
+        }
+    }
+
+    maven { url = uri("https://maven.seedfinding.com/") }
+    maven { url = uri("https://maven-snapshots.seedfinding.com/") }
+    maven { url = uri("https://jitpack.io") }
 }
 
 loom {
-	splitEnvironmentSourceSets()
+    splitEnvironmentSourceSets()
 
-	mods {
-		"seedreverser" {
-			sourceSet sourceSets.main
-			sourceSet sourceSets.client
-		}
-	}
+    mods {
+        register("seedreverser") {
+            sourceSet(sourceSets.named("main").get())
+            sourceSet(sourceSets.named("client").get())
+        }
+    }
 }
 
 dependencies {
-	// To change the versions see the gradle.properties file
-	minecraft "com.mojang:minecraft:${project.minecraft_version}"
-	// No mappings line needed for 26.2 (unobfuscated)
-	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    // Standard Fabric/Minecraft Dependencies
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    // No mappings line — 26.2 is unobfuscated
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 
-	// Fabric API
-	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+    // SeedFinding Libraries (jar-in-jar so they ship inside the mod)
+    implementation('com.seedfinding:latticg:1.07') { transitive = false }
+    include('com.seedfinding:latticg:1.07') { transitive = false }
+
+    implementation('com.seedfinding:mc_math:1.171.0') { transitive = false }
+    include('com.seedfinding:mc_math:1.171.0') { transitive = false }
+
+    implementation('com.seedfinding:mc_seed:1.171.1') { transitive = false }
+    include('com.seedfinding:mc_seed:1.171.1') { transitive = false }
+
+    implementation('com.seedfinding:mc_core:1.192.1') { transitive = false }
+    include('com.seedfinding:mc_core:1.192.1') { transitive = false }
+
+    implementation('com.seedfinding:mc_reversal:1.171.1') { transitive = false }
+    include('com.seedfinding:mc_reversal:1.171.1') { transitive = false }
 }
 
 processResources {
-	def version = project.version
-	inputs.property "version", version
+    inputs.property "version", project.version
 
-	filesMatching("fabric.mod.json") {
-		expand "version": version
-	}
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
 }
 
 tasks.withType(JavaCompile).configureEach {
-	it.options.release = 25
-	it.options.encoding = "UTF-8"
+    it.options.release = 25
+    it.options.encoding = "UTF-8"
 }
 
 java {
-	withSourcesJar()
+    withSourcesJar()
 
-	toolchain {
-		languageVersion = JavaLanguageVersion.of(25)
-	}
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
 }
 
 jar {
-	def projectName = project.name
-	inputs.property "projectName", projectName
-
-	from("LICENSE") {
-		rename { "${it}_$projectName" }
-	}
+    from("LICENSE") {
+        rename { "${it}_${project.base.archivesName.get()}" }
+    }
 }
 
-// configure the maven publication
 publishing {
-	publications {
-		create("mavenJava", MavenPublication) {
-			from components.java
-		}
-	}
-
-	repositories {
-		// Add repositories to publish to here.
-	}
+    publications {
+        register('mavenJava', MavenPublication) {
+            from(components.named('java').get())
+        }
+    }
 }
