@@ -39,7 +39,7 @@ The built jar will be in `build/libs/`.
 
 ## Credits
 
-Created by vladuism1.
+Created by vladuism1 and foxy.
 
 Uses seedfinding libraries:
 - latticg
