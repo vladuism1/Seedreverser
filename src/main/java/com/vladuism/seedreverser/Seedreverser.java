@@ -24,6 +24,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.permissions.Permissions;
 import net.minecraft.world.entity.monster.cubemob.Slime;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.levelgen.structure.StructureStart;
 
@@ -62,9 +63,10 @@ public class Seedreverser implements ModInitializer {
 
     @Override
     public void onInitialize() {
-        // 1. Passive structure detection on chunk load
+        // 1. Passive structure detection on chunk load (overworld only —
+        // the temple structures and region math are overworld-specific)
         ServerChunkEvents.CHUNK_LOAD.register((ServerLevel world, LevelChunk chunk, boolean isNewChunk) -> {
-            if (world.isClientSide()) return;
+            if (world.dimension() != Level.OVERWORLD) return;
 
             ChunkPos cPos = chunk.getPos();
 
@@ -187,8 +189,15 @@ public class Seedreverser implements ModInitializer {
                                     List<Long> structureSeeds = StructureSeedSolver.findStructureSeeds(captureList);
 
                                     if (structureSeeds.isEmpty()) {
-                                        server.execute(() -> send(src,
-                                                "No structure seeds found. Capture more structures in different regions."));
+                                        boolean timedOut = StructureSeedSolver.lastRunTimedOut();
+                                        server.execute(() -> {
+                                            if (timedOut) {
+                                                send(src, "Search timed out after 15 min before scanning the full space.");
+                                                send(src, "Capture MORE structures (4+) in different regions — each one speeds this up massively.");
+                                            } else {
+                                                send(src, "No structure seeds found. Capture more structures in different regions.");
+                                            }
+                                        });
                                         return;
                                     }
 

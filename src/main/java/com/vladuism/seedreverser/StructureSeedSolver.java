@@ -43,8 +43,17 @@ public class StructureSeedSolver {
     // Cooperative cancellation — checked in the hot loops
     private static volatile boolean cancelled = false;
 
+    // True if the last run hit the 15-minute Phase B cap before scanning the
+    // full candidate space (empty results then mean "not enough data", NOT
+    // "no seed exists in the space").
+    private static volatile boolean lastRunTimedOut = false;
+
     public static void cancel() {
         cancelled = true;
+    }
+
+    public static boolean lastRunTimedOut() {
+        return lastRunTimedOut;
     }
 
     /**
@@ -72,6 +81,7 @@ public class StructureSeedSolver {
         if (captures.isEmpty()) return results;
 
         cancelled = false;
+        lastRunTimedOut = false;
         System.out.println("[SeedReverser] Lifting with " + captures.size() + " structure(s)...");
 
         // ------------------------------------------------------------------
@@ -80,12 +90,12 @@ public class StructureSeedSolver {
         // ------------------------------------------------------------------
         List<Long> survivingLowerBits = new ArrayList<>();
 
+        ChunkRand rand = new ChunkRand();
         for (long lowerBits = 0; lowerBits < (1L << 19); lowerBits++) {
             if (cancelled) {
                 System.out.println("[SeedReverser] Cancelled during Phase A");
                 return results;
             }
-            ChunkRand rand = new ChunkRand();
             boolean matches = true;
 
             for (RegionStructure.Data<?> data : captures) {
@@ -127,7 +137,7 @@ public class StructureSeedSolver {
         for (List<Long> partition : partitions) {
             if (partition.isEmpty()) continue;
             executor.submit(() -> {
-                ChunkRand rand = new ChunkRand();
+                ChunkRand verifyRand = new ChunkRand();
                 for (long lowerBits : partition) {
                     for (long upperBits = 0; upperBits < (1L << 29); upperBits++) {
                         // Check cancel flag every ~1M iterations (cheap volatile read)
@@ -139,7 +149,7 @@ public class StructureSeedSolver {
 
                         boolean matches = true;
                         for (Feature.Data<?> data : captures) {
-                            if (!data.testStart(structureSeed, rand)) {
+                            if (!data.testStart(structureSeed, verifyRand)) {
                                 matches = false;
                                 break;
                             }
@@ -154,6 +164,9 @@ public class StructureSeedSolver {
         executor.shutdown();
         try {
             if (!executor.awaitTermination(15, TimeUnit.MINUTES)) {
+                // We did NOT finish scanning the candidate space — empty results
+                // from a timed-out run are inconclusive, not a proof of absence.
+                lastRunTimedOut = true;
                 executor.shutdownNow();
             }
         } catch (InterruptedException e) {
