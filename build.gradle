@@ -48,31 +48,38 @@ dependencies {
     implementation "net.fabricmc:fabric-loader:${project.loader_version}"
     implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 
-    // SeedFinding Libraries (jar-in-jar so they ship inside the mod)
-    implementation('com.seedfinding:latticg:1.07') { transitive = false }
-    include('com.seedfinding:latticg:1.07') { transitive = false }
+    // SeedFinding Libraries — pinned to SeedcrackerX's exact commits (MIT licensed).
+    // These versions are mutually compatible and support MC 26.2.
+    implementation("com.seedfinding:latticg:${project.latticg_version}") { transitive = false }
+    include("com.seedfinding:latticg:${project.latticg_version}") { transitive = false }
 
-    implementation('com.seedfinding:mc_math:1.171.0') { transitive = false }
-    include('com.seedfinding:mc_math:1.171.0') { transitive = false }
+    implementation("com.seedfinding:mc_math:${project.seedfinding_math_version}") { transitive = false }
+    include("com.seedfinding:mc_math:${project.seedfinding_math_version}") { transitive = false }
 
-    implementation('com.seedfinding:mc_seed:1.171.1') { transitive = false }
-    include('com.seedfinding:mc_seed:1.171.1') { transitive = false }
+    implementation("com.seedfinding:mc_seed:${project.seedfinding_seed_version}") { transitive = false }
+    include("com.seedfinding:mc_seed:${project.seedfinding_seed_version}") { transitive = false }
 
-    implementation('com.seedfinding:mc_core:1.192.1') { transitive = false }
-    include('com.seedfinding:mc_core:1.192.1') { transitive = false }
+    implementation("com.seedfinding:mc_core:${project.seedfinding_core_version}") { transitive = false }
+    include("com.seedfinding:mc_core:${project.seedfinding_core_version}") { transitive = false }
 
-    implementation('com.seedfinding:mc_reversal:1.171.1') { transitive = false }
-    include('com.seedfinding:mc_reversal:1.171.1') { transitive = false }
+    implementation("com.seedfinding:mc_noise:${project.seedfinding_noise_version}") { transitive = false }
+    include("com.seedfinding:mc_noise:${project.seedfinding_noise_version}") { transitive = false }
 
-    // Additional seedfinding libraries (like SeedcrackerX uses)
-    implementation('com.seedfinding:mc_feature:755d3611ac1c499c28289ccca5b738af6a5859b7') { transitive = false }
-    include('com.seedfinding:mc_feature:755d3611ac1c499c28289ccca5b738af6a5859b7') { transitive = false }
-    implementation('com.seedfinding:mc_biome:17af8cb1110fdc983b7cb2b887d1fb2060e23ee3') { transitive = false }
-    include('com.seedfinding:mc_biome:17af8cb1110fdc983b7cb2b887d1fb2060e23ee3') { transitive = false }
-    implementation('com.seedfinding:mc_terrain:a03e440ec5b282e399382f2cc5ad0db91b438d2e') { transitive = false }
-    include('com.seedfinding:mc_terrain:a03e440ec5b282e399382f2cc5ad0db91b438d2e') { transitive = false }
-    implementation('com.seedfinding:mc_noise:dbab3996ea3abff5dd420db53c31d5498afd2fe5') { transitive = false }
-    include('com.seedfinding:mc_noise:dbab3996ea3abff5dd420db53c31d5498afd2fe5') { transitive = false }
+    implementation("com.seedfinding:mc_biome:${project.seedfinding_biome_version}") { transitive = false }
+    include("com.seedfinding:mc_biome:${project.seedfinding_biome_version}") { transitive = false }
+
+    implementation("com.seedfinding:mc_terrain:${project.seedfinding_terrain_version}") { transitive = false }
+    include("com.seedfinding:mc_terrain:${project.seedfinding_terrain_version}") { transitive = false }
+
+    implementation("com.seedfinding:mc_feature:${project.seedfinding_feature_version}") { transitive = false }
+    include("com.seedfinding:mc_feature:${project.seedfinding_feature_version}") { transitive = false }
+
+    implementation("com.seedfinding:mc_reversal:${project.seedfinding_reversal_version}") { transitive = false }
+    include("com.seedfinding:mc_reversal:${project.seedfinding_reversal_version}") { transitive = false }
+
+    // SeedcrackerX API: interface is vendored in our source (kaptainwutax.seedcrackerX.api.SeedCrackerAPI)
+    // because jitpack does not publish a separate seedcrackerx-api artifact.
+    // At runtime, SeedcrackerX (if installed) provides its own copy of the interface.
 }
 
 processResources {

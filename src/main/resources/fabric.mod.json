@@ -11,7 +11,11 @@
   "license": "CC0-1.0",
   "environment": "*",
   "entrypoints": {
-    "main": ["com.vladuism.seedreverser.Seedreverser"]
+    "main": ["com.vladuism.seedreverser.Seedreverser"],
+    "seedcrackerx": ["com.vladuism.seedreverser.SeedCrackerEP"]
+  },
+  "suggests": {
+    "seedcrackerx": ">=2.15.0"
   },
   "depends": {
     "fabricloader": ">=0.19.5",

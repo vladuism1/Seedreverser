@@ -19,9 +19,11 @@ A Fabric mod for Minecraft 26.2 that reverse-engineers world seeds from in-game 
 
 ## How It Works
 
-1. **Phase 1 (Structure Seed)**: Brute forces the 48-bit structure seed using captured temple positions. Uses multi-threading for faster processing.
+1. **Phase 1 (Structure Seed)**: Uses the Seedfinding libraries' structure placement math. A mod-4 filter narrows 2^19 lower-bits candidates, then verifies the remaining combos against every captured structure with `Feature.Data.testStart()`. Each captured structure cuts the search space by ~2^16, so a handful of structures solves in seconds to minutes — no blind 2^48 brute force.
 
-2. **Phase 2 (World Seed)**: If slime chunks are captured, lifts the 48-bit structure seed to a 64-bit world seed by testing the upper 16 bits.
+2. **Phase 2 (World Seed)**: If slime chunks are captured, lifts the 48-bit structure seed to a 64-bit world seed by testing the upper 16 bits (65,536 candidates) with the vanilla slime chunk formula.
+
+3. **SeedcrackerX API integration**: If [SeedcrackerX](https://github.com/19MisterX98/SeedcrackerX) is installed, this mod also receives its cracked world seed via the `seedcrackerx` entrypoint and displays it with `/seedreverser seed`.
 
 ## Requirements
 
@@ -39,14 +41,10 @@ The built jar will be in `build/libs/`.
 
 ## Credits
 
-Created by vladuism1 and foxy.
+Created by vladuism1.
 
-Uses seedfinding libraries:
-- latticg
-- mc_math
-- mc_seed
-- mc_core
-- mc_reversal
+- **SeedcrackerX** (https://github.com/19MisterX98/SeedcrackerX) by KaptainWutax & 19MisterX98 — MIT License, Copyright (c) 2020 KaptainWutax. The Phase 1 lifting algorithm in `StructureSeedSolver` is adapted from SeedcrackerX's `TimeMachine.pokeLifting()`. MIT license requires this attribution — please keep it.
+- **Seedfinding libraries** (mc_core, mc_seed, mc_feature, mc_biome, mc_terrain, mc_noise, mc_math, mc_reversal, latticg) by the Seedfinding team — MIT License. Bundled jar-in-jar, pinned to SeedcrackerX's known-compatible commits.
 
 ## License
 
