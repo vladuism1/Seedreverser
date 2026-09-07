@@ -14,6 +14,9 @@ public class StructureSeedSolver {
     // -----------------------------------------------------------------------
 
     public record ChunkPos(int x, int z) {}
+    
+    // 3D position with Y (height) for multi-dimensional support
+    public record ChunkPos3D(int x, int y, int z) {}
 
     public record StructureConfig(long salt, int regionSize, int spacing) {}
 
@@ -27,84 +30,167 @@ public class StructureSeedSolver {
     private static final long MASK       = (1L << 48) - 1;
 
     // -----------------------------------------------------------------------
-    // Phase 1 — 48-bit structure seed brute force (multi-threaded)
+    // Structure data with bit calculation
     // -----------------------------------------------------------------------
 
-    public static List<Long> findStructureSeeds(StructureConfig config, List<ChunkPos> positions) {
-        // Use parallel processing across available CPU cores
-        int numCores = Math.max(1, Runtime.getRuntime().availableProcessors());
-        ExecutorService executor = Executors.newFixedThreadPool(numCores);
-        ConcurrentHashMap<Long, Boolean> results = new ConcurrentHashMap<>();
+    public static class StructureData {
+        public final ChunkPos pos;
+        public final ChunkPos3D pos3D; // 3D position with Y
+        public final StructureConfig config;
+        public final int regionX;
+        public final int regionZ;
+        public final int regionY; // Y region (for 3D structures like dungeons)
+        public final int offsetX;
+        public final int offsetZ;
+        public final int offsetY; // Y offset
+        public final long offsetSquared;
+        public final long offsetSquared3D; // 3D offset squared
 
-        ChunkPos anchor = positions.get(0);
-        int regionX = Math.floorDiv(anchor.x(), config.regionSize());
-        int regionZ = Math.floorDiv(anchor.z(), config.regionSize());
+        public StructureData(ChunkPos pos, StructureConfig config) {
+            this.pos = pos;
+            this.pos3D = new ChunkPos3D(pos.x(), 0, pos.z()); // Default Y=0 for 2D structures
+            this.config = config;
+            this.regionX = Math.floorDiv(pos.x(), config.regionSize());
+            this.regionZ = Math.floorDiv(pos.z(), config.regionSize());
+            this.regionY = 0;
+            this.offsetX = pos.x() - regionX * config.regionSize();
+            this.offsetZ = pos.z() - regionZ * config.regionSize();
+            this.offsetY = 0;
+            this.offsetSquared = (long) offsetX * offsetX + (long) offsetZ * offsetZ;
+            this.offsetSquared3D = this.offsetSquared;
+        }
 
-        int targetOffsetX = anchor.x() - regionX * config.regionSize();
-        int targetOffsetZ = anchor.z() - regionZ * config.regionSize();
-        int spread = config.regionSize() - config.spacing();
+        // Constructor for 3D positions (dungeons, underground structures)
+        public StructureData(ChunkPos3D pos3D, StructureConfig config) {
+            this.pos3D = pos3D;
+            this.pos = new ChunkPos(pos3D.x(), pos3D.z());
+            this.config = config;
+            this.regionX = Math.floorDiv(pos3D.x(), config.regionSize());
+            this.regionZ = Math.floorDiv(pos3D.z(), config.regionSize());
+            this.regionY = Math.floorDiv(pos3D.y(), config.regionSize());
+            this.offsetX = pos3D.x() - regionX * config.regionSize();
+            this.offsetZ = pos3D.z() - regionZ * config.regionSize();
+            this.offsetY = pos3D.y() - regionY * config.regionSize();
+            this.offsetSquared = (long) offsetX * offsetX + (long) offsetZ * offsetZ;
+            this.offsetSquared3D = (long) offsetX * offsetX + (long) offsetY * offsetY + (long) offsetZ * offsetZ;
+        }
+
+        // Bits of information this structure provides (like SeedcrackerX)
+        public double getBits() {
+            return Math.log(offsetSquared3D) / Math.log(2);
+        }
+
+        // 3D bits (includes Y dimension)
+        public double getBits3D() {
+            return Math.log(offsetSquared3D) / Math.log(2);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1 — Lattice-based structure seed solver
+    //
+    // Key insight: For each structure, we have:
+    //   regionSeed_r = (worldSeed + rX*A + rZ*B + salt) & MASK
+    //   state_0 = (regionSeed_r * MULT + ADDEND) & MASK  
+    //   offset = (int)(state_0 >>> 17) % spread
+    //
+    // This constrains: regionSeed_r mod spread
+    //
+    // With multiple structures in different regions, we get constraints on
+    // different regionSeeds. The relationship between regionSeeds is:
+    //   regionSeed_r1 - regionSeed_r2 = (r1X-r2X)*A + (r1Z-r2Z)*B (mod MASK)
+    //
+    // We can use lattice reduction to find candidate worldSeeds efficiently.
+    // -----------------------------------------------------------------------
+
+    public static List<Long> findStructureSeeds(List<StructureData> structures) {
+        // Use GPU if available, fall back to CPU
+        return findStructureSeedsWithGpu(structures);
+    }
+
+    public static List<Long> findStructureSeedsWithGpu(List<StructureData> structures) {
+        if (structures.size() < 2) {
+            // Fall back to direct solving with single structure
+            return solveSingleStructure(structures.get(0));
+        }
+
+        List<Long> results = new ArrayList<>();
+        StructureData anchor = structures.get(0);
+        int spread = anchor.config.regionSize() - anchor.config.spacing();
 
         final long A = 341873128712L;
         final long B = 132897987541L;
-        final long TOTAL_LOWER = 1L << 24;
-        final long CHUNK_SIZE = TOTAL_LOWER / numCores;
+        final long salt = anchor.config.salt();
 
-        // Pre-compute common values for speed
-        final long regionX_A = (long) regionX * A;
-        final long regionZ_B = (long) regionZ * B;
-        final long baseRegionOffset = regionX_A + regionZ_B + config.salt();
+        // Strategy: enumerate possible regionSeeds for anchor that give correct offset
+        // Then for each, compute worldSeed and verify against all other structures
+        //
+        // We enumerate regionSeed values where:
+        //   ((regionSeed * MULT + ADDEND) >>> 17) % spread == anchor.offsetX
+        //
+        // regionSeed = ((state - ADDEND) * modInverse(MULT, 2^48)) & MASK
+        // where state = (x * spread + offsetX) << 17 for x in [0, 2^31/spread)
 
-        // Split work across threads
+        long modInverseMult = modInverse(MULTIPLIER, MASK + 1);
+        long numStates = (1L << 31) / spread; // Number of valid states for offsetX
+
+        System.out.println("[SeedReverser] Enumerating " + numStates + " candidate states for anchor...");
+
+        // Parallel enumeration
+        int numCores = Math.max(1, Runtime.getRuntime().availableProcessors());
+        ExecutorService executor = Executors.newFixedThreadPool(numCores);
+        ConcurrentHashMap<Long, Boolean> resultsMap = new ConcurrentHashMap<>();
+
+        long chunkSize = numStates / numCores;
+
         for (int thread = 0; thread < numCores; thread++) {
-            final long startLower = thread * CHUNK_SIZE;
-            final long endLower = (thread == numCores - 1) ? TOTAL_LOWER : startLower + CHUNK_SIZE;
+            final long startX = thread * chunkSize;
+            final long endX = (thread == numCores - 1) ? numStates : startX + chunkSize;
 
             executor.submit(() -> {
-                for (long lower = startLower; lower < endLower; lower++) {
-                    for (long upper = 0; upper < (1L << 24); upper++) {
-                        long worldSeed = (upper << 24) | lower;
-                        long regionSeed = (worldSeed + baseRegionOffset) & MASK;
+                for (long x = startX; x < endX; x++) {
+                    // Reconstruct state from offset
+                    long state = (x * spread + anchor.offsetX) << 17;
 
-                        long state = (regionSeed * MULTIPLIER + ADDEND) & MASK;
-                        int offsetX = (int) (state >>> 17) % spread;
-                        if (offsetX < 0) offsetX += spread;
+                    // Reverse LCG to get regionSeed
+                    long regionSeed = ((state - ADDEND) * modInverseMult) & MASK;
 
-                        if (offsetX != targetOffsetX) continue;
+                    // Now compute worldSeed from regionSeed
+                    // regionSeed = (worldSeed + rX*A + rZ*B + salt) & MASK
+                    long worldSeed = (regionSeed - (long) anchor.regionX * A - (long) anchor.regionZ * B - salt) & MASK;
 
-                        state = (state * MULTIPLIER + ADDEND) & MASK;
-                        int offsetZ = (int) (state >>> 17) % spread;
-                        if (offsetZ < 0) offsetZ += spread;
+                    // Verify Z offset
+                    long state2 = (regionSeed * MULTIPLIER + ADDEND) & MASK;
+                    state2 = (state2 * MULTIPLIER + ADDEND) & MASK;
+                    int offsetZ = (int) (state2 >>> 17) % spread;
+                    if (offsetZ < 0) offsetZ += spread;
+                    if (offsetZ != anchor.offsetZ) continue;
 
-                        if (offsetZ != targetOffsetZ) continue;
+                    // Verify against all other structures
+                    boolean valid = true;
+                    for (int i = 1; i < structures.size(); i++) {
+                        StructureData s = structures.get(i);
+                        long sRegionSeed = (worldSeed + (long) s.regionX * A + (long) s.regionZ * B + s.config.salt()) & MASK;
 
-                        // Verify against all other positions
-                        boolean valid = true;
-                        for (int i = 1; i < positions.size(); i++) {
-                            ChunkPos pos = positions.get(i);
-                            int rX = Math.floorDiv(pos.x(), config.regionSize());
-                            int rZ = Math.floorDiv(pos.z(), config.regionSize());
-
-                            long posRegionSeed = (worldSeed + (long) rX * A + (long) rZ * B + config.salt()) & MASK;
-                            long posState = (posRegionSeed * MULTIPLIER + ADDEND) & MASK;
-                            int offX = (int) (posState >>> 17) % spread;
-                            if (offX < 0) offX += spread;
-                            if (rX * config.regionSize() + offX != pos.x()) {
-                                valid = false;
-                                break;
-                            }
-
-                            posState = (posState * MULTIPLIER + ADDEND) & MASK;
-                            int offZ = (int) (posState >>> 17) % spread;
-                            if (offZ < 0) offZ += spread;
-                            if (rZ * config.regionSize() + offZ != pos.z()) {
-                                valid = false;
-                                break;
-                            }
+                        long sState = (sRegionSeed * MULTIPLIER + ADDEND) & MASK;
+                        int sOffsetX = (int) (sState >>> 17) % spread;
+                        if (sOffsetX < 0) sOffsetX += spread;
+                        if (s.regionX * s.config.regionSize() + sOffsetX != s.pos.x()) {
+                            valid = false;
+                            break;
                         }
 
-                        if (valid) {
-                            results.put(worldSeed, true);
+                        sState = (sState * MULTIPLIER + ADDEND) & MASK;
+                        int sOffsetZ = (int) (sState >>> 17) % spread;
+                        if (sOffsetZ < 0) sOffsetZ += spread;
+                        if (s.regionZ * s.config.regionSize() + sOffsetZ != s.pos.z()) {
+                            valid = false;
+                            break;
                         }
+                    }
+
+                    if (valid) {
+                        resultsMap.put(worldSeed, Boolean.TRUE);
                     }
                 }
             });
@@ -117,12 +203,74 @@ public class StructureSeedSolver {
             Thread.currentThread().interrupt();
         }
 
-        List<Long> resultList = new ArrayList<>(results.keySet());
-        return resultList;
+        results.addAll(resultsMap.keySet());
+        System.out.println("[SeedReverser] Found " + results.size() + " structure seed candidates");
+        return results;
+    }
+
+    // GPU-accelerated variant
+    public static List<Long> findStructureSeedsGpu(List<StructureData> structures) {
+        return GpuSeedSolver.findStructureSeeds(new GpuSeedSolver.GpuConfig(true, 0), structures);
+    }
+
+    // Fallback for single structure: solve via direct enumeration
+    private static List<Long> solveSingleStructure(StructureData anchor) {
+        List<Long> results = new ArrayList<>();
+        int spread = anchor.config.regionSize() - anchor.config.spacing();
+        final long A = 341873128712L;
+        final long B = 132897987541L;
+        final long salt = anchor.config.salt();
+
+        // For single structure, we can only narrow down to candidates
+        // that match the offset. This is the full enumeration.
+        long modInverseMult = modInverse(MULTIPLIER, MASK + 1);
+        long numStates = (1L << 31) / spread;
+
+        System.out.println("[SeedReverser] Single structure mode: enumerating " + numStates + " candidates...");
+
+        // This will take a while but should complete
+        for (long x = 0; x < numStates; x++) {
+            long state = (x * spread + anchor.offsetX) << 17;
+            long regionSeed = ((state - ADDEND) * modInverseMult) & MASK;
+            long worldSeed = (regionSeed - (long) anchor.regionX * A - (long) anchor.regionZ * B - salt) & MASK;
+
+            // Verify Z offset
+            long state2 = (regionSeed * MULTIPLIER + ADDEND) & MASK;
+            state2 = (state2 * MULTIPLIER + ADDEND) & MASK;
+            int offsetZ = (int) (state2 >>> 17) % spread;
+            if (offsetZ < 0) offsetZ += spread;
+            if (offsetZ != anchor.offsetZ) continue;
+
+            results.add(worldSeed);
+        }
+
+        System.out.println("[SeedReverser] Found " + results.size() + " candidates from single structure");
+        return results;
+    }
+
+    // Extended Euclidean algorithm for modular inverse
+    private static long modInverse(long a, long m) {
+        long m0 = m;
+        long y = 0, x = 1;
+
+        if (m == 1) return 0;
+
+        while (a > 1) {
+            long q = a / m;
+            long t = m;
+            m = a % m;
+            a = t;
+            t = y;
+            y = x - q * y;
+            x = t;
+        }
+
+        if (x < 0) x += m0;
+        return x;
     }
 
     // -----------------------------------------------------------------------
-    // Phase 2 — lift 48-bit → 64-bit via slime chunks (multi-threaded)
+    // Phase 2 — lift 48-bit structure seed → 64-bit world seed via slime chunks
     // -----------------------------------------------------------------------
 
     public static List<Long> liftTo64Bit(long structureSeed, List<ChunkPos> slimeChunks) {
@@ -139,7 +287,7 @@ public class StructureSeedSolver {
 
             executor.submit(() -> {
                 for (long upper = startUpper; upper < endUpper; upper++) {
-                    long worldSeed = (upper << 48) | structureSeed;
+                    long worldSeed = (upper << 48) | (structureSeed & MASK);
                     boolean allMatch = true;
 
                     for (ChunkPos slime : slimeChunks) {

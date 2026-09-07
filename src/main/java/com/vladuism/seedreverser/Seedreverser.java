@@ -30,7 +30,7 @@ import java.util.Set;
 public class Seedreverser implements ModInitializer {
     public static final String MOD_ID = "seedreverser";
 
-    private static final Set<StructureSeedSolver.ChunkPos> capturedTemples = new HashSet<>();
+    private static final Set<StructureSeedSolver.StructureData> capturedStructures = new HashSet<>();
     private static final Set<StructureSeedSolver.ChunkPos> capturedSlimes = new HashSet<>();
 
     @Override
@@ -40,25 +40,38 @@ public class Seedreverser implements ModInitializer {
             if (world.isClientSide()) return;
 
             ChunkPos cPos = chunk.getPos();
-            int chunkX = cPos.getMinBlockX() >> 4;
-            int chunkZ = cPos.getMinBlockZ() >> 4;
+            // Use chunk coordinates directly - cPos.x() and cPos.z() give chunk coordinates
+            int chunkX = cPos.x();
+            int chunkZ = cPos.z();
             StructureSeedSolver.ChunkPos solverPos = new StructureSeedSolver.ChunkPos(chunkX, chunkZ);
 
-            if (capturedTemples.contains(solverPos)) return;
+            // Check if we already have this structure
+            boolean alreadyHas = false;
+            for (StructureSeedSolver.StructureData existing : capturedStructures) {
+                if (existing.pos.x() == solverPos.x() && existing.pos.z() == solverPos.z() && existing.config == StructureSeedSolver.TEMPLE_CONFIG) {
+                    alreadyHas = true;
+                    break;
+                }
+            }
+            if (alreadyHas) return;
 
             // Check if chunk contains a temple structure
             for (StructureStart start : chunk.getAllStarts().values()) {
                 if (!start.isValid()) continue;
                 
                 // Find matching structure in registry
-                for (HolderLookup.RegistryLookup<Structure> lookup : world.registryAccess().lookup(Registries.STRUCTURE).stream().toList()) {
-                    for (Holder.Reference<Structure> ref : lookup.listElements().toList()) {
+                for (HolderLookup.RegistryLookup<net.minecraft.world.level.levelgen.structure.Structure> lookup : world.registryAccess().lookup(Registries.STRUCTURE).stream().toList()) {
+                    for (Holder.Reference<net.minecraft.world.level.levelgen.structure.Structure> ref : lookup.listElements().toList()) {
                         if (ref.value() == start.getStructure()) {
-                            ResourceKey<Structure> key = ref.unwrapKey().orElse(null);
+                            ResourceKey<net.minecraft.world.level.levelgen.structure.Structure> key = ref.unwrapKey().orElse(null);
                             if (key != null) {
                                 String structureKey = key.identifier().toString();
-                                if (isTempleStructure(structureKey) && capturedTemples.add(solverPos)) {
-                                    broadcastToOps(world, "Auto-detected temple at chunk (" + chunkX + ", " + chunkZ + ")!");
+                                if (isTempleStructure(structureKey)) {
+                                    StructureSeedSolver.StructureData data = new StructureSeedSolver.StructureData(
+                                            new StructureSeedSolver.ChunkPos(chunkX, chunkZ), StructureSeedSolver.TEMPLE_CONFIG);
+                                    if (capturedStructures.add(data)) {
+                                        broadcastToOps(world, "Auto-detected temple at chunk (" + chunkX + ", " + chunkZ + ")!");
+                                    }
                                 }
                             }
                         }
@@ -76,7 +89,11 @@ public class Seedreverser implements ModInitializer {
                     int chunkZ = cPos.getMinBlockZ() >> 4;
                     StructureSeedSolver.ChunkPos solverPos = new StructureSeedSolver.ChunkPos(chunkX, chunkZ);
 
-                    boolean hasSlime = !world.getEntitiesOfClass(Slime.class, player.getBoundingBox().inflate(16)).isEmpty();
+                    // Verify slime is actually in a slime spawn position (underground)
+                    // Check for slimes below y=40 which is where slime chunks spawn them
+                    boolean hasSlime = world.getEntitiesOfClass(Slime.class, 
+                            player.getBoundingBox().inflate(16)).stream()
+                            .anyMatch(s -> s.getY() < 40);
 
                     if (hasSlime && capturedSlimes.add(solverPos)) {
                         send(player.createCommandSourceStack(), "Auto-detected slime chunk at (" + chunkX + ", " + chunkZ + ")!");
@@ -96,24 +113,27 @@ public class Seedreverser implements ModInitializer {
                 .then(Commands.literal("solve")
                         .executes(ctx -> {
                             CommandSourceStack src = ctx.getSource();
-                            List<StructureSeedSolver.ChunkPos> templeList = new ArrayList<>(capturedTemples);
+                            List<StructureSeedSolver.StructureData> structureList = new ArrayList<>(capturedStructures);
                             List<StructureSeedSolver.ChunkPos> slimeList = new ArrayList<>(capturedSlimes);
 
-                            if (templeList.size() < 2) {
-                                send(src, "Need at least 2 detected temples! Walk around desert/swamp/jungle biomes to scan loaded chunks.");
-                                send(src, "Currently captured: " + templeList.size() + " temple(s).");
+                            if (structureList.size() < 1) {
+                                send(src, "Need at least 1 detected structure! Walk around to scan loaded chunks.");
+                                send(src, "Currently captured: " + structureList.size() + " structure(s).");
                                 return 0;
                             }
 
-                            send(src, "Solving seed using " + templeList.size() + " auto-detected temple(s)...");
+                            double totalBits = 0;
+                            for (StructureSeedSolver.StructureData sd : structureList) {
+                                totalBits += sd.getBits();
+                            }
+                            send(src, "Solving seed using " + structureList.size() + " structure(s) (" + totalBits + " bits)...");
 
                             new Thread(() -> {
                                 try {
-                                    List<Long> structureSeeds = StructureSeedSolver.findStructureSeeds(
-                                            StructureSeedSolver.TEMPLE_CONFIG, templeList);
+                                    List<Long> structureSeeds = StructureSeedSolver.findStructureSeedsGpu(structureList);
 
                                     if (structureSeeds.isEmpty()) {
-                                        send(src, "No structure seeds found from captured positions.");
+                                        send(src, "No structure seeds found. Try capturing more structures in different regions.");
                                         return;
                                     }
 
@@ -144,14 +164,14 @@ public class Seedreverser implements ModInitializer {
 
                 .then(Commands.literal("status")
                         .executes(ctx -> {
-                            send(ctx.getSource(), "Captured Temples: " + capturedTemples.size()
+                            send(ctx.getSource(), "Captured Structures: " + capturedStructures.size()
                                     + " | Captured Slimes: " + capturedSlimes.size());
                             return 1;
                         }))
 
                 .then(Commands.literal("clear")
                         .executes(ctx -> {
-                            capturedTemples.clear();
+                            capturedStructures.clear();
                             capturedSlimes.clear();
                             send(ctx.getSource(), "Cleared all captured data.");
                             return 1;
