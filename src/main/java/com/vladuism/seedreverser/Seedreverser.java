@@ -28,9 +28,9 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.levelgen.structure.StructureStart;
 
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 @SuppressWarnings({"unused", "SpellCheckingInspection"})
 public class Seedreverser implements ModInitializer {
@@ -45,8 +45,13 @@ public class Seedreverser implements ModInitializer {
     private static final SwampHut SWAMP_HUT = new SwampHut(SF_VERSION);
     private static final Igloo IGLOO = new Igloo(SF_VERSION);
 
-    private static final Set<RegionStructure.Data<?>> capturedStructures = new HashSet<>();
-    private static final Set<ChunkPos> capturedSlimes = new HashSet<>();
+    // Concurrent sets: mutated on the server thread, read on solver threads
+    private static final Set<RegionStructure.Data<?>> capturedStructures = ConcurrentHashMap.newKeySet();
+    private static final Set<ChunkPos> capturedSlimes = ConcurrentHashMap.newKeySet();
+
+    // Explicit dedupe keys (feature:originChunk) — Data may use identity equals,
+    // and the same structure start is reported by every chunk it covers.
+    private static final Set<String> seenStructures = ConcurrentHashMap.newKeySet();
 
     // World seed received from SeedcrackerX (via API)
     private static volatile Long externalWorldSeed = null;
@@ -66,10 +71,19 @@ public class Seedreverser implements ModInitializer {
             for (StructureStart start : chunk.getAllStarts().values()) {
                 if (!start.isValid()) continue;
 
-                RegionStructure.Data<?> data = identifyStructure(world, start, cPos);
-                if (data != null && capturedStructures.add(data)) {
+                // IMPORTANT: use the StructureStart's ORIGIN chunk, not the loading
+                // chunk — big structures are referenced by many chunks, and using the
+                // wrong chunk would compute wrong region/offset data.
+                ChunkPos origin = start.getChunkPos();
+
+                RegionStructure.Data<?> data = identifyStructure(world, start, origin);
+                if (data == null) continue;
+
+                String dedupeKey = data.feature.getName() + ":" + origin.x() + ":" + origin.z();
+                if (seenStructures.add(dedupeKey)) {
+                    capturedStructures.add(data);
                     broadcastToOps(world, "Auto-detected " + data.feature.getName()
-                            + " at chunk (" + cPos.x() + ", " + cPos.z() + ")!");
+                            + " at chunk (" + origin.x() + ", " + origin.z() + ")!");
                 }
             }
         });
@@ -80,19 +94,23 @@ public class Seedreverser implements ModInitializer {
                 for (ServerPlayer player : world.players()) {
                     ChunkPos cPos = player.chunkPosition();
 
-                    boolean hasSlime = false;
-                    for (Slime slime : world.getEntitiesOfClass(Slime.class,
-                            player.getBoundingBox().inflate(16))) {
-                        if (slime.getY() < 40) {
-                            hasSlime = true;
-                            break;
-                        }
+                boolean hasSlime = false;
+                ChunkPos slimeChunk = null;
+                for (Slime slime : world.getEntitiesOfClass(Slime.class,
+                        player.getBoundingBox().inflate(16))) {
+                    if (slime.getY() < 40) {
+                        hasSlime = true;
+                        // Record the SLIME's chunk, not the player's — inflate(16)
+                        // can reach slimes in neighbouring chunks.
+                        slimeChunk = slime.chunkPosition();
+                        break;
                     }
+                }
 
-                    if (hasSlime && capturedSlimes.add(cPos)) {
-                        send(player.createCommandSourceStack(),
-                                "Auto-detected slime chunk at (" + cPos.x() + ", " + cPos.z() + ")!");
-                    }
+                if (hasSlime && slimeChunk != null && capturedSlimes.add(slimeChunk)) {
+                    send(player.createCommandSourceStack(),
+                            "Auto-detected slime chunk at (" + slimeChunk.x() + ", " + slimeChunk.z() + ")!");
+                }
                 }
             }
         });
@@ -224,6 +242,7 @@ public class Seedreverser implements ModInitializer {
                         .executes(ctx -> {
                             capturedStructures.clear();
                             capturedSlimes.clear();
+                            seenStructures.clear();
                             externalWorldSeed = null;
                             send(ctx.getSource(), "Cleared all data.");
                             return 1;
