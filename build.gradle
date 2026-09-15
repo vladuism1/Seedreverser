@@ -17,7 +17,7 @@ repositories {
     exclusiveContent {
         forRepository {
             repositories.maven {
-                url = uri("https://maven.latticg.com/")
+                url = uri("https://maven.seedfinding.com/")
             }
         }
         filter {
@@ -36,50 +36,28 @@ loom {
     mods {
         register("seedreverser") {
             sourceSet(sourceSets.named("main").get())
-            sourceSet(sourceSets.named("client").get())
         }
     }
 }
 
 dependencies {
     // Standard Fabric/Minecraft Dependencies
-    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    minecraft "com.mojang:minecraft:${project.minecraft_library_version}"
     // No mappings line — 26.2 is unobfuscated
     implementation "net.fabricmc:fabric-loader:${project.loader_version}"
     implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 
-    // SeedFinding Libraries — pinned to SeedcrackerX's exact commits (MIT licensed).
-    // These versions are mutually compatible and support MC 26.2.
-    implementation("com.seedfinding:latticg:${project.latticg_version}") { transitive = false }
+    // SeedFinding Libraries — pinned to SeedcrackerX-compatible versions (MIT licensed)
     include("com.seedfinding:latticg:${project.latticg_version}") { transitive = false }
 
-    implementation("com.seedfinding:mc_math:${project.seedfinding_math_version}") { transitive = false }
     include("com.seedfinding:mc_math:${project.seedfinding_math_version}") { transitive = false }
-
-    implementation("com.seedfinding:mc_seed:${project.seedfinding_seed_version}") { transitive = false }
     include("com.seedfinding:mc_seed:${project.seedfinding_seed_version}") { transitive = false }
-
-    implementation("com.seedfinding:mc_core:${project.seedfinding_core_version}") { transitive = false }
     include("com.seedfinding:mc_core:${project.seedfinding_core_version}") { transitive = false }
-
-    implementation("com.seedfinding:mc_noise:${project.seedfinding_noise_version}") { transitive = false }
     include("com.seedfinding:mc_noise:${project.seedfinding_noise_version}") { transitive = false }
-
-    implementation("com.seedfinding:mc_biome:${project.seedfinding_biome_version}") { transitive = false }
     include("com.seedfinding:mc_biome:${project.seedfinding_biome_version}") { transitive = false }
-
-    implementation("com.seedfinding:mc_terrain:${project.seedfinding_terrain_version}") { transitive = false }
     include("com.seedfinding:mc_terrain:${project.seedfinding_terrain_version}") { transitive = false }
-
-    implementation("com.seedfinding:mc_feature:${project.seedfinding_feature_version}") { transitive = false }
     include("com.seedfinding:mc_feature:${project.seedfinding_feature_version}") { transitive = false }
-
-    implementation("com.seedfinding:mc_reversal:${project.seedfinding_reversal_version}") { transitive = false }
     include("com.seedfinding:mc_reversal:${project.seedfinding_reversal_version}") { transitive = false }
-
-    // SeedcrackerX API: interface is vendored in our source (kaptainwutax.seedcrackerX.api.SeedCrackerAPI)
-    // because jitpack does not publish a separate seedcrackerx-api artifact.
-    // At runtime, SeedcrackerX (if installed) provides its own copy of the interface.
 }
 
 processResources {
@@ -91,21 +69,25 @@ processResources {
 }
 
 tasks.withType(JavaCompile).configureEach {
-    it.options.release = 25
+    it.options.release = 21
     it.options.encoding = "UTF-8"
+    it.options.compilerArgs << "--enable-preview"
 }
 
 java {
     withSourcesJar()
 
     toolchain {
-        languageVersion = JavaLanguageVersion.of(25)
+        languageVersion = JavaLanguageVersion.of(21)
     }
 }
 
 jar {
     from("LICENSE") {
         rename { "${it}_${project.base.archivesName.get()}" }
+    }
+    from(sourceSets.main.output) {
+        include "kaptainwutax/**"
     }
 }
 
@@ -115,4 +97,8 @@ publishing {
             from(components.named('java').get())
         }
     }
+}
+
+tasks.register("checkDeps", ConfigurationReport) {
+    configuration = configurations.runtimeClasspath
 }

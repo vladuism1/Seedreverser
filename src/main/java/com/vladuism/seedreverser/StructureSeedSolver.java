@@ -5,14 +5,12 @@ import com.seedfinding.mccore.version.MCVersion;
 import com.seedfinding.mcfeature.Feature;
 import com.seedfinding.mcfeature.structure.RegionStructure;
 import com.seedfinding.mcfeature.structure.UniformStructure;
+import net.minecraft.world.level.ChunkPos;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.LongStream;
 
@@ -40,34 +38,55 @@ public class StructureSeedSolver {
     // LCG constants (java.util.Random) — kept for the slime chunk formula
     private static final long MASK = (1L << 48) - 1;
 
-    // Cooperative cancellation — checked in the hot loops
-    private static volatile boolean cancelled = false;
+    // Cooperative cancellation — checked in the hot loops (volatile for memory visibility)
+    private static final AtomicBoolean cancelled = new AtomicBoolean(false);
 
     // True if the last run hit the 15-minute Phase B cap before scanning the
     // full candidate space (empty results then mean "not enough data", NOT
     // "no seed exists in the space").
-    private static volatile boolean lastRunTimedOut = false;
+    private static final AtomicBoolean lastRunTimedOut = new AtomicBoolean(false);
+
+    // Reused executor pool (daemon, low priority) — created lazily
+    private static final AtomicReference<ExecutorService> solverExecutor = new AtomicReference<>();
 
     public static void cancel() {
-        cancelled = true;
+        cancelled.set(true);
+        // Interrupt any running tasks
+        ExecutorService exec = solverExecutor.getAndSet(null);
+        if (exec != null) {
+            exec.shutdownNow();
+        }
     }
 
     public static boolean lastRunTimedOut() {
-        return lastRunTimedOut;
+        return lastRunTimedOut.get();
     }
 
     /**
-     * Solver threads: 2 fewer than cores (leave the game headroom),
-     * daemon (so quitting MC doesn't hang), low priority (game stays responsive).
+     * Gets or creates the solver executor pool.
+     * Threads: cores - 2 (leave headroom for game), daemon, low priority.
      */
-    private static ExecutorService newSolverExecutor() {
-        int threads = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
-        return Executors.newFixedThreadPool(threads, r -> {
-            Thread t = new Thread(r, "SeedReverser-Worker");
-            t.setDaemon(true);
-            t.setPriority(Thread.MIN_PRIORITY + 1);
-            return t;
+    private static ExecutorService getSolverExecutor() {
+        return solverExecutor.updateAndGet(exec -> {
+            if (exec != null && !exec.isShutdown()) return exec;
+            int threads = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
+            return Executors.newFixedThreadPool(threads, r -> {
+                Thread t = new Thread(r, "SeedReverser-Worker");
+                t.setDaemon(true);
+                t.setPriority(Thread.MIN_PRIORITY + 1);
+                return t;
+            });
         });
+    }
+
+    /**
+     * Shuts down the solver executor (called on mod unload or explicit cancel).
+     */
+    static void shutdownExecutor() {
+        ExecutorService exec = solverExecutor.getAndSet(null);
+        if (exec != null) {
+            exec.shutdownNow();
+        }
     }
 
     /**
@@ -80,8 +99,8 @@ public class StructureSeedSolver {
         List<Long> results = new ArrayList<>();
         if (captures.isEmpty()) return results;
 
-        cancelled = false;
-        lastRunTimedOut = false;
+        cancelled.set(false);
+        lastRunTimedOut.set(false);
         System.out.println("[SeedReverser] Lifting with " + captures.size() + " structure(s)...");
 
         // ------------------------------------------------------------------
@@ -92,16 +111,25 @@ public class StructureSeedSolver {
 
         ChunkRand rand = new ChunkRand();
         for (long lowerBits = 0; lowerBits < (1L << 19); lowerBits++) {
-            if (cancelled) {
+            // Check cancellation every 1024 iterations (cheap volatile read)
+            if ((lowerBits & 0x3FF) == 0 && cancelled.get()) {
                 System.out.println("[SeedReverser] Cancelled during Phase A");
                 return results;
             }
+
             boolean matches = true;
 
             for (RegionStructure.Data<?> data : captures) {
                 rand.setRegionSeed(lowerBits, data.regionX, data.regionZ,
                         data.feature.getSalt(), VERSION);
-                int offset = ((UniformStructure<?>) data.feature).getOffset();
+
+                // Get offset — handle both UniformStructure and others
+                int offset = getOffset(data.feature);
+                if (offset <= 0) {
+                    matches = false;
+                    break;
+                }
+
                 // Two sequential nextInt calls mirror vanilla: X offset first, then Z
                 if (rand.nextInt(offset) % 4 != data.offsetX % 4
                         || rand.nextInt(offset) % 4 != data.offsetZ % 4) {
@@ -124,122 +152,189 @@ public class StructureSeedSolver {
         // ------------------------------------------------------------------
         Set<Long> structureSeeds = ConcurrentHashMap.newKeySet();
 
-        ExecutorService executor = newSolverExecutor();
-
-        // Split surviving lower values across threads
-        List<List<Long>> partitions = new ArrayList<>();
+        ExecutorService executor = getSolverExecutor();
         int workerCount = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
+
+        // Partition surviving lowerBits across workers
+        List<List<Long>> partitions = new ArrayList<>(workerCount);
         for (int i = 0; i < workerCount; i++) partitions.add(new ArrayList<>());
         for (int i = 0; i < survivingLowerBits.size(); i++) {
             partitions.get(i % workerCount).add(survivingLowerBits.get(i));
         }
 
+        CountDownLatch latch = new CountDownLatch(partitions.size());
+        AtomicBoolean phaseBCancelled = new AtomicBoolean(false);
+
         for (List<Long> partition : partitions) {
-            if (partition.isEmpty()) continue;
+            if (partition.isEmpty()) {
+                latch.countDown();
+                continue;
+            }
             executor.submit(() -> {
-                ChunkRand verifyRand = new ChunkRand();
-                for (long lowerBits : partition) {
-                    for (long upperBits = 0; upperBits < (1L << 29); upperBits++) {
-                        // Check cancel flag every ~1M iterations (cheap volatile read)
-                        if ((upperBits & 0xFFFFF) == 0 && cancelled) {
-                            return;
-                        }
-
-                        long structureSeed = (upperBits << 19) | lowerBits;
-
-                        boolean matches = true;
-                        for (Feature.Data<?> data : captures) {
-                            if (!data.testStart(structureSeed, verifyRand)) {
-                                matches = false;
-                                break;
+                try {
+                    ChunkRand verifyRand = new ChunkRand();
+                    for (long lowerBits : partition) {
+                        // Check cancel every 65536 iterations
+                        long cancelCheckMask = 0xFFFFL;
+                        for (long upperBits = 0; upperBits < (1L << 29); upperBits++) {
+                            if ((upperBits & cancelCheckMask) == 0) {
+                                if (cancelled.get() || phaseBCancelled.get()) {
+                                    return;
+                                }
                             }
-                        }
 
-                        if (matches) structureSeeds.add(structureSeed);
+                            long structureSeed = (upperBits << 19) | lowerBits;
+
+                            boolean matches = true;
+                            for (RegionStructure.Data<?> data : captures) {
+                                if (!data.testStart(structureSeed, verifyRand)) {
+                                    matches = false;
+                                    break;
+                                }
+                            }
+
+                            if (matches) structureSeeds.add(structureSeed);
+                        }
                     }
+                } finally {
+                    latch.countDown();
                 }
             });
         }
 
-        executor.shutdown();
+        boolean completed;
         try {
-            if (!executor.awaitTermination(15, TimeUnit.MINUTES)) {
-                // We did NOT finish scanning the candidate space — empty results
-                // from a timed-out run are inconclusive, not a proof of absence.
-                lastRunTimedOut = true;
-                executor.shutdownNow();
-            }
+            completed = latch.await(15, TimeUnit.MINUTES);
         } catch (InterruptedException e) {
-            executor.shutdownNow();
             Thread.currentThread().interrupt();
+            completed = false;
         }
 
-        if (cancelled) {
+        if (!completed) {
+            // We did NOT finish scanning the candidate space — empty results
+            // from a timed-out run are inconclusive, not a proof of absence.
+            lastRunTimedOut.set(true);
+            phaseBCancelled.set(true);
+            // Don't shutdown executor here — it's reused
+        }
+
+        if (cancelled.get()) {
             System.out.println("[SeedReverser] Solver cancelled — returning partial results");
             results.addAll(structureSeeds);
             return results;
         }
 
+        // Sort for deterministic output
         results.addAll(structureSeeds.stream().sorted().collect(Collectors.toList()));
         System.out.println("[SeedReverser] Found " + results.size() + " structure seed candidate(s)");
         return results;
+    }
+
+    /**
+     * Gets the region spacing offset for a feature.
+     * Handles both UniformStructure and other RegionStructure types.
+     */
+    private static int getOffset(Feature<?> feature) {
+        if (feature instanceof UniformStructure<?> us) {
+            return us.getOffset();
+        }
+        // Fallback for non-UniformStructure features (e.g., some RuinedPortal configs)
+        try {
+            return (int) feature.getClass().getMethod("getOffset").invoke(feature);
+        } catch (Exception e) {
+            return -1;
+        }
     }
 
     // -----------------------------------------------------------------------
     // Phase 2 — lift 48-bit structure seed to 64-bit world seed via slime chunks
     // -----------------------------------------------------------------------
 
-    public static List<Long> liftTo64Bit(long structureSeed, List<net.minecraft.world.level.ChunkPos> slimeChunks) {
-        ExecutorService executor = newSolverExecutor();
-        ConcurrentHashMap<Long, Boolean> results = new ConcurrentHashMap<>();
+    public static List<Long> liftTo64Bit(long structureSeed, List<ChunkPos> slimeChunks) {
+        if (slimeChunks.isEmpty()) return List.of();
 
-        final long TOTAL_UPPER = 1L << 16;
+        ExecutorService executor = getSolverExecutor();
+        Set<Long> results = ConcurrentHashMap.newKeySet();
+
+        final long TOTAL_UPPER = 1L << 16; // 65536 upper bits combinations
         int numCores = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
-        final long CHUNK_SIZE = Math.max(1, TOTAL_UPPER / numCores);
+        // Minimum chunk size of 256 to avoid task overhead
+        final long CHUNK_SIZE = Math.max(256, TOTAL_UPPER / numCores);
+        int numTasks = (int) ((TOTAL_UPPER + CHUNK_SIZE - 1) / CHUNK_SIZE);
 
-        for (int thread = 0; thread < numCores; thread++) {
-            final long startUpper = thread * CHUNK_SIZE;
-            final long endUpper = (thread == numCores - 1) ? TOTAL_UPPER : startUpper + CHUNK_SIZE;
+        CountDownLatch latch = new CountDownLatch(numTasks);
+        AtomicBoolean phase2Cancelled = new AtomicBoolean(false);
+
+        for (int task = 0; task < numTasks; task++) {
+            final long startUpper = task * CHUNK_SIZE;
+            final long endUpper = Math.min(startUpper + CHUNK_SIZE, TOTAL_UPPER);
 
             executor.submit(() -> {
-                for (long upper = startUpper; upper < endUpper; upper++) {
-                    long worldSeed = (upper << 48) | (structureSeed & MASK);
-                    boolean allMatch = true;
+                try {
+                    for (long upper = startUpper; upper < endUpper; upper++) {
+                        // Check cancel every 4096 iterations
+                        if ((upper & 0xFFF) == 0 && (cancelled.get() || phase2Cancelled.get())) {
+                            return;
+                        }
 
-                    for (net.minecraft.world.level.ChunkPos slime : slimeChunks) {
-                        if (!isSlimeChunk(worldSeed, slime.x(), slime.z())) {
-                            allMatch = false;
-                            break;
+                        long worldSeed = (upper << 48) | (structureSeed & MASK);
+                        boolean allMatch = true;
+
+                        for (ChunkPos slime : slimeChunks) {
+                            if (!isSlimeChunk(worldSeed, slime.x(), slime.z())) {
+                                allMatch = false;
+                                break;
+                            }
+                        }
+
+                        if (allMatch) {
+                            results.add(worldSeed);
                         }
                     }
-
-                    if (allMatch) {
-                        results.put(worldSeed, true);
-                    }
+                } finally {
+                    latch.countDown();
                 }
             });
         }
 
-        executor.shutdown();
         try {
-            executor.awaitTermination(10, TimeUnit.MINUTES);
+            boolean completed = latch.await(10, TimeUnit.MINUTES);
+            if (!completed) {
+                phase2Cancelled.set(true);
+                System.out.println("[SeedReverser] Phase 2 (slime lift) timed out after 10 minutes");
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            phase2Cancelled.set(true);
         }
 
-        return new ArrayList<>(results.keySet());
+        return new ArrayList<>(results);
     }
 
-    // Vanilla slime chunk formula (matches isSlimeChunk in Minecraft source)
+    /**
+     * Vanilla slime chunk formula — matches SeedcrackerX's ChunkRand-based implementation.
+     * Formula: seed = worldSeed + chunkX^2 * 0x4c1906 + chunkX * 0x5ac0db + chunkZ^2 * 0x4307a7 + chunkZ * 0x5f24f ^ 0x3ad8025f
+     * Then: new Random(seed).nextInt(10) == 0
+     */
     public static boolean isSlimeChunk(long worldSeed, int chunkX, int chunkZ) {
         long seed = worldSeed
-                + (long) (chunkX * chunkX * 0x4c1906)
-                + (long) (chunkX * 0x5ac0db)
-                + (long) (chunkZ * chunkZ) * 0x4307a7L
-                + (long) (chunkZ * 0x5f24f)
+                + (long) chunkX * chunkX * 0x4c1906L
+                + (long) chunkX * 0x5ac0dbL
+                + (long) chunkZ * chunkZ * 0x4307a7L
+                + (long) chunkZ * 0x5f24fL
                 ^ 0x3ad8025fL;
 
+        // Use java.util.Random to match vanilla exactly (SeedcrackerX does the same)
         java.util.Random rand = new java.util.Random(seed);
+        return rand.nextInt(10) == 0;
+    }
+
+    // For testing/debugging: expose slime chunk formula using ChunkRand (alternative)
+    static boolean isSlimeChunkChunkRand(long worldSeed, int chunkX, int chunkZ) {
+        ChunkRand rand = new ChunkRand();
+        rand.setSeed(worldSeed);
+        rand.consume(chunkX);
+        rand.consume(chunkZ);
         return rand.nextInt(10) == 0;
     }
 }

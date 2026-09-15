@@ -1,13 +1,16 @@
 pluginManagement {
-	repositories {
-		maven {
-			name = 'Fabric'
-			url = 'https://maven.fabricmc.net/'
-		}
-		mavenCentral()
-		gradlePluginPortal()
-	}
+    repositories {
+        gradlePluginPortal()
+        mavenCentral()
+        maven { url = uri("https://maven.fabricmc.net/") }
+    }
+    resolutionStrategy {
+        eachPlugin {
+            if (requested.id.id == "net.fabricmc.fabric-loom") {
+                useVersion("0.14")
+            }
+        }
+    }
 }
 
-// Should match your modid
-rootProject.name = 'seedreverser'
+rootProject.name = "seedreverser"
