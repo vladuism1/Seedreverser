@@ -1,8 +1,15 @@
-// noinspection GroovyAssignabilityCheck
-plugins {
-    id 'net.fabricmc.fabric-loom' version "${loom_version}"
-    id 'maven-publish'
+buildscript {
+    repositories {
+        mavenCentral()
+        maven { url = uri("https://maven.fabricmc.net/") }
+    }
+    dependencies {
+        classpath "net.fabricmc:fabric-loom:1.0.0"
+    }
 }
+
+apply plugin: 'net.fabricmc.fabric-loom'
+apply plugin: 'maven-publish'
 
 version = project.version
 group = project.group
