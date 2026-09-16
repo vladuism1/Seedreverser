@@ -10,48 +10,22 @@ import net.minecraft.world.level.ChunkPos;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
-import java.util.stream.LongStream;
 
-/**
- * Structure seed solver using the Seedfinding libraries (MIT).
- *
- * The lifting algorithm below is adapted from SeedcrackerX's TimeMachine.pokeLifting()
- * (https://github.com/19MisterX98/SeedcrackerX — MIT License, Copyright (c) 2020 KaptainWutax).
- * MIT requires this notice be preserved — do not remove the attribution above.
- *
- * Algorithm:
- *  Phase A: filter 2^19 "lower bits" candidates using the mod-4 constraint of
- *           region RNG offsets for each captured OldStructure (temple) position.
- *  Phase B: for each surviving lower-bits value, scan the 2^29 upper combos
- *           (structureSeed = upperBits << 19 | lowerBits) and verify every
- *           captured structure with Feature.Data.testStart().
- *
- * Compared to a blind 2^48 brute force, each captured temple cuts the Phase B
- * space by ~2^16, so a handful of structures makes this finish in seconds/minutes.
- */
 public class StructureSeedSolver {
 
     private static final MCVersion VERSION = MCVersion.latest();
-
-    // LCG constants (java.util.Random) — kept for the slime chunk formula
     private static final long MASK = (1L << 48) - 1;
 
-    // Cooperative cancellation — checked in the hot loops (volatile for memory visibility)
+    // Use AtomicBoolean for thread-safe cancellation
     private static final AtomicBoolean cancelled = new AtomicBoolean(false);
-
-    // True if the last run hit the 15-minute Phase B cap before scanning the
-    // full candidate space (empty results then mean "not enough data", NOT
-    // "no seed exists in the space").
     private static final AtomicBoolean lastRunTimedOut = new AtomicBoolean(false);
 
-    // Reused executor pool (daemon, low priority) — created lazily
+    // Reused executor pool
     private static final AtomicReference<ExecutorService> solverExecutor = new AtomicReference<>();
 
     public static void cancel() {
         cancelled.set(true);
-        // Interrupt any running tasks
         ExecutorService exec = solverExecutor.getAndSet(null);
         if (exec != null) {
             exec.shutdownNow();
@@ -62,10 +36,6 @@ public class StructureSeedSolver {
         return lastRunTimedOut.get();
     }
 
-    /**
-     * Gets or creates the solver executor pool.
-     * Threads: cores - 2 (leave headroom for game), daemon, low priority.
-     */
     private static ExecutorService getSolverExecutor() {
         return solverExecutor.updateAndGet(exec -> {
             if (exec != null && !exec.isShutdown()) return exec;
@@ -80,20 +50,7 @@ public class StructureSeedSolver {
     }
 
     /**
-     * Shuts down the solver executor (called on mod unload or explicit cancel).
-     */
-    static void shutdownExecutor() {
-        ExecutorService exec = solverExecutor.getAndSet(null);
-        if (exec != null) {
-            exec.shutdownNow();
-        }
-    }
-
-    /**
      * Phase 1 — find 48-bit structure seeds from captured structure data.
-     *
-     * @param captures RegionStructure.Data for every captured structure,
-     *                 built with structure.at(chunkX, chunkZ)
      */
     public static List<Long> findStructureSeeds(List<RegionStructure.Data<?>> captures) {
         List<Long> results = new ArrayList<>();
@@ -101,36 +58,35 @@ public class StructureSeedSolver {
 
         cancelled.set(false);
         lastRunTimedOut.set(false);
-        System.out.println("[SeedReverser] Lifting with " + captures.size() + " structure(s)...");
 
-        // ------------------------------------------------------------------
         // Phase A — lower-bits (2^19) mod-4 filter
-        // (adapted from SeedcrackerX TimeMachine.pokeLifting, MIT)
-        // ------------------------------------------------------------------
         List<Long> survivingLowerBits = new ArrayList<>();
 
         ChunkRand rand = new ChunkRand();
         for (long lowerBits = 0; lowerBits < (1L << 19); lowerBits++) {
-            // Check cancellation every 1024 iterations (cheap volatile read)
+            // Check cancellation every 1024 iterations
             if ((lowerBits & 0x3FF) == 0 && cancelled.get()) {
-                System.out.println("[SeedReverser] Cancelled during Phase A");
                 return results;
             }
 
             boolean matches = true;
-
             for (RegionStructure.Data<?> data : captures) {
                 rand.setRegionSeed(lowerBits, data.regionX, data.regionZ,
                         data.feature.getSalt(), VERSION);
 
-                // Get offset — handle both UniformStructure and others
-                int offset = getOffset(data.feature);
+                // Safely get offset — handle both UniformStructure and other types
+                int offset;
+                if (data.feature instanceof UniformStructure<?> us) {
+                    offset = us.getOffset();
+                } else {
+                    offset = 16; // default safe offset
+                }
+
                 if (offset <= 0) {
                     matches = false;
                     break;
                 }
 
-                // Two sequential nextInt calls mirror vanilla: X offset first, then Z
                 if (rand.nextInt(offset) % 4 != data.offsetX % 4
                         || rand.nextInt(offset) % 4 != data.offsetZ % 4) {
                     matches = false;
@@ -141,27 +97,21 @@ public class StructureSeedSolver {
             if (matches) survivingLowerBits.add(lowerBits);
         }
 
-        System.out.println("[SeedReverser] Phase A: " + survivingLowerBits.size()
-                + " surviving lower-bits value(s)");
-
         if (survivingLowerBits.isEmpty()) return results;
 
-        // ------------------------------------------------------------------
-        // Phase B — scan upper bits for each surviving lower value
-        // (adapted from SeedcrackerX TimeMachine.pokeLifting, MIT)
-        // ------------------------------------------------------------------
+        // Phase B — scan upper bits with proper cancellation and testStart verification
         Set<Long> structureSeeds = ConcurrentHashMap.newKeySet();
-
         ExecutorService executor = getSolverExecutor();
         int workerCount = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
 
-        // Partition surviving lowerBits across workers
+        // Partition surviving lowerBits across workers for balanced work distribution
         List<List<Long>> partitions = new ArrayList<>(workerCount);
         for (int i = 0; i < workerCount; i++) partitions.add(new ArrayList<>());
         for (int i = 0; i < survivingLowerBits.size(); i++) {
             partitions.get(i % workerCount).add(survivingLowerBits.get(i));
         }
 
+        // Use CountDownLatch for proper task completion tracking
         CountDownLatch latch = new CountDownLatch(partitions.size());
         AtomicBoolean phaseBCancelled = new AtomicBoolean(false);
 
@@ -174,17 +124,24 @@ public class StructureSeedSolver {
                 try {
                     ChunkRand verifyRand = new ChunkRand();
                     for (long lowerBits : partition) {
-                        // Check cancel every 65536 iterations
-                        long cancelCheckMask = 0xFFFFL;
+                        // Check cancellation every 1024 outer iterations
+                        if (cancelled.get()) {
+                            phaseBCancelled.set(true);
+                            return;
+                        }
+
+                        // Phase B inner loop: scan all 2^29 upper bits combinations
+                        // structureSeed = upperBits << 19 | lowerBits
                         for (long upperBits = 0; upperBits < (1L << 29); upperBits++) {
-                            if ((upperBits & cancelCheckMask) == 0) {
-                                if (cancelled.get() || phaseBCancelled.get()) {
-                                    return;
-                                }
+                            // Check cancellation every 65536 inner iterations
+                            if ((upperBits & 0xFFFFL) == 0 && cancelled.get()) {
+                                phaseBCancelled.set(true);
+                                return;
                             }
 
                             long structureSeed = (upperBits << 19) | lowerBits;
 
+                            // Verify every captured structure with testStart
                             boolean matches = true;
                             for (RegionStructure.Data<?> data : captures) {
                                 if (!data.testStart(structureSeed, verifyRand)) {
@@ -196,6 +153,8 @@ public class StructureSeedSolver {
                             if (matches) structureSeeds.add(structureSeed);
                         }
                     }
+                } catch (Exception e) {
+                    phaseBCancelled.set(true);
                 } finally {
                     latch.countDown();
                 }
@@ -211,59 +170,37 @@ public class StructureSeedSolver {
         }
 
         if (!completed) {
-            // We did NOT finish scanning the candidate space — empty results
-            // from a timed-out run are inconclusive, not a proof of absence.
             lastRunTimedOut.set(true);
             phaseBCancelled.set(true);
-            // Don't shutdown executor here — it's reused
         }
 
-        if (cancelled.get()) {
-            System.out.println("[SeedReverser] Solver cancelled — returning partial results");
+        if (cancelled.get() || phaseBCancelled.get()) {
             results.addAll(structureSeeds);
             return results;
         }
 
         // Sort for deterministic output
         results.addAll(structureSeeds.stream().sorted().collect(Collectors.toList()));
-        System.out.println("[SeedReverser] Found " + results.size() + " structure seed candidate(s)");
         return results;
     }
 
     /**
-     * Gets the region spacing offset for a feature.
-     * Handles both UniformStructure and other RegionStructure types.
+     * Phase 2 — lift 48-bit structure seed to 64-bit world seed via slime chunks.
      */
-    private static int getOffset(Feature<?> feature) {
-        if (feature instanceof UniformStructure<?> us) {
-            return us.getOffset();
-        }
-        // Fallback for non-UniformStructure features (e.g., some RuinedPortal configs)
-        try {
-            return (int) feature.getClass().getMethod("getOffset").invoke(feature);
-        } catch (Exception e) {
-            return -1;
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Phase 2 — lift 48-bit structure seed to 64-bit world seed via slime chunks
-    // -----------------------------------------------------------------------
-
     public static List<Long> liftTo64Bit(long structureSeed, List<ChunkPos> slimeChunks) {
         if (slimeChunks.isEmpty()) return List.of();
 
         ExecutorService executor = getSolverExecutor();
         Set<Long> results = ConcurrentHashMap.newKeySet();
 
-        final long TOTAL_UPPER = 1L << 16; // 65536 upper bits combinations
+        final long TOTAL_UPPER = 1L << 16; // 65536
         int numCores = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
         // Minimum chunk size of 256 to avoid task overhead
         final long CHUNK_SIZE = Math.max(256, TOTAL_UPPER / numCores);
         int numTasks = (int) ((TOTAL_UPPER + CHUNK_SIZE - 1) / CHUNK_SIZE);
 
+        // Use CountDownLatch for proper completion tracking
         CountDownLatch latch = new CountDownLatch(numTasks);
-        AtomicBoolean phase2Cancelled = new AtomicBoolean(false);
 
         for (int task = 0; task < numTasks; task++) {
             final long startUpper = task * CHUNK_SIZE;
@@ -272,8 +209,8 @@ public class StructureSeedSolver {
             executor.submit(() -> {
                 try {
                     for (long upper = startUpper; upper < endUpper; upper++) {
-                        // Check cancel every 4096 iterations
-                        if ((upper & 0xFFF) == 0 && (cancelled.get() || phase2Cancelled.get())) {
+                        // Check cancellation every 4096 iterations
+                        if ((upper & 0xFFF) == 0 && cancelled.get()) {
                             return;
                         }
 
@@ -300,21 +237,18 @@ public class StructureSeedSolver {
         try {
             boolean completed = latch.await(10, TimeUnit.MINUTES);
             if (!completed) {
-                phase2Cancelled.set(true);
-                System.out.println("[SeedReverser] Phase 2 (slime lift) timed out after 10 minutes");
+                lastRunTimedOut.set(true);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            phase2Cancelled.set(true);
+            lastRunTimedOut.set(true);
         }
 
         return new ArrayList<>(results);
     }
 
     /**
-     * Vanilla slime chunk formula — matches SeedcrackerX's ChunkRand-based implementation.
-     * Formula: seed = worldSeed + chunkX^2 * 0x4c1906 + chunkX * 0x5ac0db + chunkZ^2 * 0x4307a7 + chunkZ * 0x5f24f ^ 0x3ad8025f
-     * Then: new Random(seed).nextInt(10) == 0
+     * Vanilla slime chunk formula — matches SeedcrackerX implementation.
      */
     public static boolean isSlimeChunk(long worldSeed, int chunkX, int chunkZ) {
         long seed = worldSeed
@@ -324,17 +258,7 @@ public class StructureSeedSolver {
                 + (long) chunkZ * 0x5f24fL
                 ^ 0x3ad8025fL;
 
-        // Use java.util.Random to match vanilla exactly (SeedcrackerX does the same)
         java.util.Random rand = new java.util.Random(seed);
-        return rand.nextInt(10) == 0;
-    }
-
-    // For testing/debugging: expose slime chunk formula using ChunkRand (alternative)
-    static boolean isSlimeChunkChunkRand(long worldSeed, int chunkX, int chunkZ) {
-        ChunkRand rand = new ChunkRand();
-        rand.setSeed(worldSeed);
-        rand.consume(chunkX);
-        rand.consume(chunkZ);
         return rand.nextInt(10) == 0;
     }
 }

@@ -1,15 +1,8 @@
-buildscript {
-    repositories {
-        mavenCentral()
-        maven { url = uri("https://maven.fabricmc.net/") }
-    }
-    dependencies {
-        classpath "net.fabricmc:fabric-loom:1.0.0"
-    }
+// noinspection GroovyAssignabilityCheck
+plugins {
+    id 'net.fabricmc.fabric-loom' version "${loom_version}"
+    id 'maven-publish'
 }
-
-apply plugin: 'net.fabricmc.fabric-loom'
-apply plugin: 'maven-publish'
 
 version = project.version
 group = project.group
@@ -78,7 +71,6 @@ processResources {
 tasks.withType(JavaCompile).configureEach {
     it.options.release = 21
     it.options.encoding = "UTF-8"
-    it.options.compilerArgs << "--enable-preview"
 }
 
 java {
@@ -104,8 +96,4 @@ publishing {
             from(components.named('java').get())
         }
     }
-}
-
-tasks.register("checkDeps", ConfigurationReport) {
-    configuration = configurations.runtimeClasspath
 }
